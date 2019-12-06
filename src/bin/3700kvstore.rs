@@ -34,6 +34,8 @@ struct Message {
     prevLog: Option<(usize, u32)>,
     #[serde(default)]
     term: Option<u32>,
+    #[serde(default)]
+    failed: Option<Vec<LogEntry>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, PartialEq, Clone)]
@@ -74,8 +76,10 @@ struct State {
     log: Vec<LogEntry>,
     committedID: usize,
     lastApplied: usize,
+    lastReportedOK: usize,
     swarmSize: usize,
     storage: HashMap<String, String>,
+    failedPending: Vec<LogEntry>,
 }
 
 impl State {
@@ -84,43 +88,83 @@ impl State {
     }
     fn apply_committed(&mut self) {
         if self.committedID > self.lastApplied {
-            debug!("[{}] Entering Apply committed", self.myID);
+            debug!("[{}] Entering Apply committed, lastApplied: {}, committedID: {}", self.myID, self.lastApplied, self.committedID);
             for i in self.lastApplied + 1..=self.committedID {
-                debug!("[{}] committing entry {}", self.myID, i);
+//                debug!("[{}] committing entry {}", self.myID, i);
                 match &self.log[i-1].operation {
                     Operation::Put(x, y) => {
                         self.storage.insert(x.clone(), y.clone());
                     }
                 }
             }
+            if self.masterState == 0 { self.lastReportedOK = self.committedID; }
             self.lastApplied = self.committedID;
         }
     }
     fn process_AE(&mut self, ae_message: &AEMessage) -> bool {
-        debug!("[{}] Entered process_AE.", self.myID);
+//        debug!("[{}] Entering process_AE.", self.myID);
         if ae_message.term < self.currentTerm {
-            debug!("[{}] Wrong Term.", self.myID);
+            debug!("[{}] process_AE: Wrong Term.", self.myID);
             return false;
         }
         if ae_message.prevLog != None && self.log.len() > 0 {
-            let prevLog = ae_message.prevLog.unwrap();
+            let prevLog = ae_message.prevLog.expect("Cannot get prevLog");
             if prevLog.0 != 0 && ( prevLog.0-1 >= self.log.len() || self.log[prevLog.0-1].term != prevLog.1 ) {
-                debug!("[{}] Wrong prevLog.", self.myID);
+                debug!("[{}] process_AE: Wrong prevLog.", self.myID);
                 return false;
             }
         }
         if ae_message.entries.len() == 0 { return true; }
         if ae_message.entries[0].id - 1 < self.log.len() {
-            self.log.drain(ae_message.entries[0].id-1..);
+            let mut failed: Vec<_> = self.log.drain(ae_message.entries[0].id-1..).collect();
+            self.failedPending.append(&mut failed);
         } else if ae_message.entries[0].id - 1 > self.log.len() {
-            panic!("Received AE message with missing logs!");
+            error!("[{}] process_AE: Received AE message with missing logs!", self.myID);
+            return false;
         }
         for entry in ae_message.entries.iter() {
             self.log.push(entry.clone());
         }
+        self.failedPending.retain(|pending| {
+            let mut flag = true;
+            for new_entry in ae_message.entries.iter() {
+                if pending.id == new_entry.id && pending.MID == new_entry.MID { flag = false; }
+            }
+            flag
+        });
         self.committedID = ae_message.committedID;
         self.apply_committed();
         return true;
+    }
+    fn send_failed(&self, stream: &UnixSeqpacket) {
+        let message = Message {
+            src: self.myID.clone(),
+            dst: self.leader.clone(),
+            leader: self.leader.clone(),
+            m_type: "send-failed".into(),
+            term: Some(self.currentTerm),
+            failed: Some(self.failedPending.clone()),
+            ..Default::default()
+        };
+        debug!("[{}] indicating put requests failed: {:?}", self.myID, message.failed.clone().unwrap());
+        stream
+            .send(serde_json::to_string(&message).unwrap().as_bytes())
+            .expect("Socket Send Error");
+    }
+    fn send_failed_ok(&self, stream: &UnixSeqpacket, src: &String, failed: Vec<LogEntry>) {
+        debug!("[{}] replying failed request received for {} entries.", self.myID, failed.len());
+        let message = Message {
+            src: self.myID.clone(),
+            dst: src.clone(),
+            leader: self.leader.clone(),
+            m_type: "send-failed-ok".into(),
+            term: Some(self.currentTerm),
+            failed: Some(failed),
+            ..Default::default()
+        };
+        stream
+            .send(serde_json::to_string(&message).unwrap().as_bytes())
+            .expect("Socket Send Error");
     }
     fn AE_ok(&self, stream: &UnixSeqpacket, msg: &Message, result: bool) {
         let message = Message {
@@ -191,7 +235,7 @@ impl State {
             value: value.clone(),
             ..Default::default()
         };
-        debug!("[{}] Replying get_ok. {:?}", self.myID, message);
+        debug!("[{}] Replying get_ok. value: {}", self.myID, message.clone().value);
         stream
             .send(serde_json::to_string(&message).unwrap().as_bytes())
             .expect("Socket Send Error");
@@ -251,9 +295,14 @@ impl State {
             .expect("Socket Send Error");
     }
     fn AE(&self, leader_state: &LeaderState, stream: &UnixSeqpacket) {
-        debug!("[{}] Entering AE.", self.myID);
+//        debug!("[{}] Entering AE.", self.myID);
         let mut rng = rand::thread_rng();
         for (rep_name, rep_nextIndex) in leader_state.nextIndex.iter() {
+            let rep_nextIndex = (*rep_nextIndex).min(self.log.len()+1);
+            let max_entries = self.log.len().min(rep_nextIndex-1+50);
+            if self.log.len() > 0 {
+                debug!("[{}] rep_nextIndex:{} self.log.last().id: {}", self.myID, rep_nextIndex, self.log.last().unwrap().id);
+            }
             let message = Message {
                 src: self.myID.clone(),
                 dst: rep_name.into(),
@@ -263,23 +312,30 @@ impl State {
                 ae_message: Some(AEMessage {
                     term: self.currentTerm,
                     committedID: self.committedID,
-                    prevLog: if self.log.len() > 0 && *rep_nextIndex > 1 {
-                        Some((*rep_nextIndex - 1, self.log[*rep_nextIndex - 2].term))
+                    prevLog: if self.log.len() > 0 && rep_nextIndex > 1 {
+                        Some((rep_nextIndex - 1, self.log[rep_nextIndex - 2].term))
                     } else {
                         Some((0, 0))
                     },
-                    entries: self.log[*rep_nextIndex-1..].to_vec(),
+                    entries: if self.log.len() > 0 && rep_nextIndex -1 == self.log.last().unwrap().id {
+                        vec![]
+                    } else if self.log.len() > 0 && rep_nextIndex >= 1 {
+                        self.log[rep_nextIndex - 1..max_entries].to_vec()
+                    } else {
+                        vec![]
+                    },
                 }),
                 ..Default::default()
             };
-//            debug!("[{}] Sending AE.", self.myID);
+            let debug_ae_message = message.ae_message.clone().unwrap();
+            debug!("[{}] Sending AE to {} with {} entries: {:?}.", self.myID, rep_name, debug_ae_message.entries.len(), c![x.id, for x in debug_ae_message.entries.iter()]);
             stream
                 .send(serde_json::to_string(&message).unwrap().as_bytes())
                 .expect("Socket Send Error");
         }
     }
     fn retry_AE(&self, leader_state: &LeaderState, stream: &UnixSeqpacket, dst: &String) {
-        debug!("[{}] Entering Retry AE. leader_state: {:#?} retrying on: {}.", self.myID, leader_state, dst);
+        debug!("[{}] Entering Retry AE. retrying on: {} with nextIndex: {} .", self.myID, dst, leader_state.nextIndex.get(dst).unwrap());
         let mut rng = rand::thread_rng();
         let rep_nextIndex = leader_state.nextIndex.get(dst).unwrap();
         let message = Message {
@@ -300,7 +356,7 @@ impl State {
             }),
             ..Default::default()
         };
-//        debug!("[{}] Retry Sending AE.", self.myID);
+        debug!("[{}] Sending Retry AE to {} with {} entries.", self.myID, dst, message.ae_message.clone().unwrap().entries.len());
         stream
             .send(serde_json::to_string(&message).unwrap().as_bytes())
             .expect("Socket Send Error");
@@ -310,7 +366,7 @@ impl State {
         if self.votedFor == None || m.term.unwrap() > self.currentTerm {
             if m.prevLog != None && self.log.len() > 0 {
                 if self.log.last().unwrap().term > m.prevLog.unwrap().1
-                    || self.log.len() - 1 > m.prevLog.unwrap().0
+                    || ( self.log.last().unwrap().term == m.prevLog.unwrap().1 && self.log.len() - 1 > m.prevLog.unwrap().0 )
                 {
                     debug!("[{}] Candidate {} has older log, not voting.", self.myID, m.src);
                     return false;
@@ -322,16 +378,16 @@ impl State {
             self.vote(stream, &m.src);
             return true;
         }
-        debug!("[{}] Candidate {} has older term (me:{} he: {}) or I have voted, not voting.", self.myID, m.src, self.currentTerm, m.term.unwrap());
+        debug!("[{}] Candidate {} has older term (me:{} he:{}) or I have voted, not voting.", self.myID, m.src, self.currentTerm, m.term.unwrap());
         return false;
     }
-    fn fail(&self, stream: &UnixSeqpacket, msg: &Message) {
+    fn fail(&self, stream: &UnixSeqpacket, src: &String, MID: &String) {
         let message = Message {
             src: self.myID.clone(),
-            dst: msg.src.clone(),
+            dst: src.clone(),
             leader: self.leader.clone(),
             m_type: "fail".into(),
-            MID: msg.MID.clone(),
+            MID: MID.clone(),
             ..Default::default()
         };
         stream
@@ -339,7 +395,7 @@ impl State {
             .expect("Socket Send Error");
     }
     fn process_AE_ok(&mut self, leader_state: &mut LeaderState, stream: &UnixSeqpacket, m: &Message) {
-//        debug!("[{}] Processing AE-ok", self.myID);
+        debug!("[{}] Processing AE-ok for {} with prevLog:{:?}", self.myID, m.src, m.prevLog);
         if m.value == "false" {
             if *leader_state.nextIndex.entry(m.src.clone()).or_default() > m.prevLog.unwrap().0 + 1 {
                 *leader_state.nextIndex.entry(m.src.clone()).or_default() = m.prevLog.unwrap().0 + 1;
@@ -349,8 +405,10 @@ impl State {
             self.retry_AE(&leader_state, &stream, &m.src);
         } else {
             if m.prevLog.unwrap().0 == 0 { return; }
+            let max_index = m.prevLog.unwrap().0.min(self.log.len());
             if m.prevLog.unwrap().0 >= *leader_state.nextIndex.get(&m.src).unwrap() {
-                for i in *leader_state.matchIndex.get(&m.src).unwrap()+1..=m.prevLog.unwrap().0 {
+                debug!("[{}] checking logs of range {}-{}, log.len:{}",self.myID, *leader_state.matchIndex.get(&m.src).unwrap(), max_index-1, self.log.len());
+                for i in *leader_state.matchIndex.get(&m.src).unwrap()+1..=max_index {
                     leader_state.pendingOp.entry(i).or_default().insert(m.src.clone());
                     debug!("[{}] Entry {} now has {} replication.", self.myID, i, leader_state.pendingOp.get(&i).unwrap().len());
                     if leader_state.pendingOp.entry(i).or_default().len() + 1 > self.swarmSize / 2 && i > self.committedID && self.log[i-1].term == self.currentTerm
@@ -358,10 +416,21 @@ impl State {
                         debug!("[{}] Entry {} replicated on majority, committing.", self.myID, i);
                         self.committedID = i;
                         debug!("[{}] committedID is now {}", self.myID, self.committedID);
-                        let entry = &self.log[i-1];
-                        match entry.operation {
-                            Operation::Put(_,_) => self.put_ok(&stream, &entry.src, &entry.MID)
+                        if self.lastReportedOK == 0 {
+                            let entry = &self.log[i-1];
+                            info!("[{}] Sending put_ok for log[{}]", self.myID, i - 1);
+                            match entry.operation {
+                                Operation::Put(_,_) => self.put_ok(&stream, &entry.src, &entry.MID)
+                            }
+                        } else {
+                            info!("[{}] Sending put_ok from {} to {}", self.myID, self.lastReportedOK, i - 1);
+                            for entry in self.log[self.lastReportedOK..=i - 1].iter() {
+                                match entry.operation {
+                                    Operation::Put(_, _) => self.put_ok(&stream, &entry.src, &entry.MID)
+                                }
+                            }
                         }
+                        self.lastReportedOK = self.committedID;
                     }
                     if leader_state.pendingOp.entry(i).or_default().len() + 1 == self.swarmSize
                     {
@@ -398,7 +467,7 @@ struct LeaderState {
     nextIndex: HashMap<String, usize>,
     matchIndex: HashMap<String, usize>,
     pendingOp: HashMap<usize, HashSet<String>>,
-    pendingMsg: HashMap<usize, Message>,
+    failedOp: HashSet<String>,
 }
 
 fn main() {
@@ -433,21 +502,21 @@ fn main() {
 
     let stream = UnixSeqpacket::connect(arg_my_ID).expect("Cannot connect to socket.");
     stream
-        .set_read_timeout(Some(Duration::from_millis(50)))
+        .set_read_timeout(Some(Duration::from_millis(10)))
         .expect("Setting read timeout failed");
 
     let mut state = State::new();
     state.swarmSize = arg_replica_IDs.len() + 1;
     state.myID = arg_my_ID.into();
     state.leader = "FFFF".into();
-    let mut buf = [0; 16892];
+    let mut buf = [0; 168920];
 
     loop {
         match state.masterState {
             0 => {
                 let mut follower_state = FollowerState {
                     lastReceived: Instant::now(),
-                    electionTimeout: Duration::from_millis(rand::thread_rng().gen_range(150, 300)),
+                    electionTimeout: Duration::from_millis(rand::thread_rng().gen_range(300, 500)),
                 };
                 info!("[{}] Entering Follower State. Timeout: {}ms", state.myID, follower_state.electionTimeout.as_millis());
                 loop {
@@ -462,6 +531,7 @@ fn main() {
                         let m: Message = serde_json::from_str(&String::from_utf8_lossy(&buf[..count])).expect("parse JSON failed");
                         if m.term != None && m.term.unwrap() > state.currentTerm {
                             state.currentTerm = m.term.unwrap();
+                            state.leader = "FFFF".into();
                             state.votedFor = None;
                             debug!("[{}] higher term {} found, updating.", state.myID, m.term.unwrap());
                         }
@@ -472,18 +542,28 @@ fn main() {
                                 }
                             }
                             "get" => {
-                                state.redirect(&stream, &m);
+                                if state.leader == "FFFF" {
+                                    state.fail(&stream, &m.src, &m.MID);
+                                } else {
+                                    state.redirect(&stream, &m);
+                                }
                             }
                             "put" => {
-                                state.redirect(&stream, &m);
+                                if state.leader == "FFFF" {
+                                    state.fail(&stream, &m.src, &m.MID);
+                                } else {
+                                    state.redirect(&stream, &m);
+                                }
                             }
                             "append-entries" => {
                                 follower_state.lastReceived = Instant::now();
                                 if m.ae_message != None {
                                     let ae_message = m.ae_message.clone().unwrap();
-                                    if state.leader == "FFFF" {
+                                    if state.leader == "FFFF" && ae_message.term == state.currentTerm {
                                         state.leader = m.src.clone();
                                         state.currentTerm = ae_message.term;
+                                    } else if state.leader == "FFFF" && ae_message.term < state.currentTerm {
+                                        break;
                                     }
                                     if ae_message.term > state.currentTerm {
                                         debug!("[{}] Updating my Term and leader.", state.myID);
@@ -492,7 +572,18 @@ fn main() {
                                     }
                                     let result = state.process_AE(&ae_message);
                                     state.AE_ok(&stream, &m, result);
+                                    if state.failedPending.len() > 0 {
+                                        state.send_failed(&stream);
+                                    }
                                 }
+                            }
+                            "send-failed-ok" => {
+                                debug!("[{}] send-failed-ok received, removing pending entries", state.myID);
+                                let failed_entries = m.failed.unwrap();
+                                for failed_entry in failed_entries.iter() {
+                                    state.failedPending.retain(|x| x.MID != failed_entry.MID );
+                                }
+                                debug!("[{}] new remaining send-failed pending: {:?}", state.myID, state.failedPending);
                             }
                             _ => {}
                         }
@@ -510,9 +601,9 @@ fn main() {
             1 => 'candidate: loop {
                 let mut candidate_state = CandidateState {
                     electionStarted: Instant::now(),
-                    electionTimeout: Duration::from_millis(rand::thread_rng().gen_range(150, 300)),
+                    electionTimeout: Duration::from_millis(rand::thread_rng().gen_range(300, 500)),
                     votes: HashMap::new(),
-                    votes_received: 0,
+                    votes_received: 1,
                 };
                 info!("[{}] Entering Candidate State for term {}.", state.myID, state.currentTerm);
                 state.request_vote(&stream);
@@ -532,10 +623,17 @@ fn main() {
                             state.masterState = 0;
                             state.votedFor = None;
                             debug!("[{}] higher term {} found, reverting to follower.", state.myID, m.term.unwrap());
+                            match m.m_type.as_ref() {
+                                "request-vote" => {
+                                    state.handle_vote_request(&stream, &m);
+                                }
+                                _ => {}
+                            }
                             break 'candidate;
                         }
                         match m.m_type.as_ref() {
                             "vote" => {
+                                debug!("[{}] Received vote from {}, total now: {}", state.myID, m.src, candidate_state.votes_received);
                                 if !candidate_state.votes.contains_key(&m.src) {
                                     candidate_state.votes.insert(m.src, 1);
                                     candidate_state.votes_received += 1;
@@ -543,7 +641,8 @@ fn main() {
                             }
                             "request-vote" => {
                                 if state.handle_vote_request(&stream, &m) {
-                                    candidate_state.electionStarted = Instant::now();
+                                    state.masterState = 0;
+                                    break 'candidate;
                                 }
                             }
                             "append-entries" => {
@@ -574,10 +673,10 @@ fn main() {
                         break 'candidate;
                     }
                     if candidate_state.electionStarted.elapsed() > candidate_state.electionTimeout {
+                        debug!("[{}] Voting timed out for term {}.", state.myID, state.currentTerm);
                         state.currentTerm += 1;
                         state.masterState = 1;
                         state.votedFor = Some(state.myID.clone());
-                        debug!("[{}] Voting timed out for term {}.", state.myID, state.currentTerm);
                         break;
                     }
                 }
@@ -586,11 +685,11 @@ fn main() {
                 info!("[{}] Entering Leader State.", state.myID);
                 let mut leader_state = LeaderState {
                     lastHeartbeat: Instant::now(),
-                    heartbeatTimeout: Duration::from_millis(100),
+                    heartbeatTimeout: Duration::from_millis(60),
                     nextIndex: Default::default(),
                     matchIndex: Default::default(),
                     pendingOp: Default::default(),
-                    pendingMsg: Default::default(),
+                    failedOp: Default::default(),
                 };
                 for rep in arg_replica_IDs.iter() {
                     leader_state.nextIndex.insert(rep.parse().unwrap(), state.log.len()+1);
@@ -615,6 +714,12 @@ fn main() {
                             state.masterState = 0;
                             state.leader = "FFFF".into();
                             debug!("[{}] Found new term {}, reverting to follower.", state.myID, m.term.unwrap());
+                            match m.m_type.as_ref() {
+                                "request-vote" => {
+                                    state.handle_vote_request(&stream, &m);
+                                }
+                                _ => {}
+                            }
                             break 'leader;
                         }
                         match m.m_type.as_ref() {
@@ -644,7 +749,6 @@ fn main() {
                                 };
                                 debug!("[{}] Creating new entry : {:?}", state.myID, new_entry);
                                 leader_state.pendingOp.insert(new_entry.id, HashSet::new());
-                                leader_state.pendingMsg.insert(new_entry.id, m.clone());
                                 state.log.push(new_entry);
                             }
                             "AE-ok" => {
@@ -654,6 +758,17 @@ fn main() {
                                 }
                                 state.process_AE_ok(&mut leader_state, &stream, &m);
                                 state.apply_committed();
+                            }
+                            "send-failed" => {
+                                let failed_entries = m.failed.unwrap();
+                                debug!("[{}] Received send-failed for {} items.", state.myID, failed_entries.len());
+                                for failed_entry in failed_entries.iter() {
+                                    if !leader_state.failedOp.contains(&failed_entry.MID) {
+                                        leader_state.failedOp.insert(failed_entry.MID.clone());
+                                        state.fail(&stream, &failed_entry.src, &failed_entry.MID);
+                                    }
+                                }
+                                state.send_failed_ok(&stream, &m.src, failed_entries);
                             }
                             _ => {}
                         }
