@@ -126,6 +126,7 @@ impl State {
             self.log.push(entry.clone());
         }
         self.failedPending.retain(|pending| {
+            // Collecting failed entries
             let mut flag = true;
             for new_entry in ae_message.entries.iter() {
                 if pending.id == new_entry.id && pending.MID == new_entry.MID { flag = false; }
@@ -146,7 +147,7 @@ impl State {
             failed: Some(self.failedPending.clone()),
             ..Default::default()
         };
-        debug!("[{}] indicating put requests failed: {:?}", self.myID, message.failed.clone().unwrap());
+        debug!("[{}] indicating to leader put requests failed: {:?}", self.myID, message.failed.clone().unwrap());
         stream
             .send(serde_json::to_string(&message).unwrap().as_bytes())
             .expect("Socket Send Error");
@@ -299,6 +300,7 @@ impl State {
         let mut rng = rand::thread_rng();
         for (rep_name, rep_nextIndex) in leader_state.nextIndex.iter() {
             let rep_nextIndex = (*rep_nextIndex).min(self.log.len()+1);
+            // UNIX_Seqpacket seems to be size limited, so only send 50 entries at a time.
             let max_entries = self.log.len().min(rep_nextIndex-1+50);
             if self.log.len() > 0 {
                 debug!("[{}] rep_nextIndex:{} self.log.last().id: {}", self.myID, rep_nextIndex, self.log.last().unwrap().id);
@@ -395,8 +397,10 @@ impl State {
             .expect("Socket Send Error");
     }
     fn process_AE_ok(&mut self, leader_state: &mut LeaderState, stream: &UnixSeqpacket, m: &Message) {
+        // Leader process AE responses
         debug!("[{}] Processing AE-ok for {} with prevLog:{:?}", self.myID, m.src, m.prevLog);
         if m.value == "false" {
+            // AE failed, sending older entries
             if *leader_state.nextIndex.entry(m.src.clone()).or_default() > m.prevLog.unwrap().0 + 1 {
                 *leader_state.nextIndex.entry(m.src.clone()).or_default() = m.prevLog.unwrap().0 + 1;
             } else {
@@ -404,6 +408,7 @@ impl State {
             }
             self.retry_AE(&leader_state, &stream, &m.src);
         } else {
+            // AE success, checking for commits
             if m.prevLog.unwrap().0 == 0 { return; }
             let max_index = m.prevLog.unwrap().0.min(self.log.len());
             if m.prevLog.unwrap().0 >= *leader_state.nextIndex.get(&m.src).unwrap() {
@@ -434,11 +439,13 @@ impl State {
                     }
                     if leader_state.pendingOp.entry(i).or_default().len() + 1 == self.swarmSize
                     {
+                        // Save memory by removing unused pending operations
                         debug!("[{}] Entry {} all replicated, removing from pending.", self.myID, i);
                         leader_state.pendingOp.remove(&i);
                     }
 
                 }
+                // Update NextIndex for each replica
                 leader_state.nextIndex.insert(m.src.clone(), m.prevLog.unwrap().0 + 1);
                 leader_state.matchIndex.insert(m.src.clone(), m.prevLog.unwrap().0);
             }
