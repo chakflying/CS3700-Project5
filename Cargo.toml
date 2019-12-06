@@ -14,3 +14,4 @@ unix_socket = { git = "https://github.com/dkl/unix-socket", branch = "seqpacket"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 cute = "0.3.0"
+rand = "*"

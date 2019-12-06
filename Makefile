@@ -17,6 +17,10 @@ build:
 	@$(CARGO) build --release
 	cp target/release/3700kvstore ./
 
+debug:
+	@$(CARGO) build
+	cp target/debug/3700kvstore ./
+
 check:
 	@$(CARGO) check
 
